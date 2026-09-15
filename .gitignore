@@ -1,0 +1,5 @@
+__pycache__/
+*.log
+saves/
+act.bin
+act1.bin

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>双果蝇连接组对弈 · 3D</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0e14;color:#cfd8e3;font-family:"Segoe UI",system-ui,sans-serif;overflow:hidden}
+  #c{position:fixed;inset:0}
+  .panel{position:fixed;background:rgba(13,18,28,.88);border:1px solid #233047;border-radius:10px;padding:10px 12px;font-size:13px;backdrop-filter:blur(4px)}
+  h3{margin:2px 0 6px;font-size:15px;color:#8fc1ff;letter-spacing:.5px}
+  button{background:#1b2740;color:#cfe3ff;border:1px solid #2e4470;border-radius:6px;padding:5px 10px;margin:3px 3px 3px 0;cursor:pointer;font-size:13px}
+  button:hover{background:#24365c}
+  button.warn{border-color:#7a3b3b;color:#ffb3b3}
+  button.on{background:#1f4a2c;border-color:#3f8f57;color:#c9ffd9}
+  .fly0{color:#6fc2ff}.fly1{color:#ff8fb3}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:1.5px 4px;border-bottom:1px solid #1a2436}
+  .num{font-variant-numeric:tabular-nums;text-align:right}
+  /* corner brain panels */
+  #p0{top:14px;left:14px;width:350px}
+  #p1{top:14px;right:14px;width:350px}
+  .bview{width:100%;height:clamp(150px,27vh,300px);margin:2px 0 4px;border:1px solid #1a2436;border-radius:8px;touch-action:none;user-select:none}
+  .hint{font-size:11px;color:#5f6d84;margin-bottom:4px}
+  .pstat{font-size:12px;color:#7d8ba1}
+  .qcv{width:100%;height:38px;display:block;margin-top:4px;border:1px solid #1a2436;border-radius:6px}
+  /* top-center winrate */
+  #wr{top:14px;left:50%;transform:translateX(-50%);width:360px}
+  .wrrow{display:flex;align-items:center;gap:8px;margin:4px 0}
+  .bar{flex:1;height:10px;background:#1a2436;border-radius:5px;overflow:hidden}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,#2e7fd9,#6fc2ff);transition:width .5s}
+  .bar.w1 i{background:linear-gradient(90deg,#d94f7f,#ff8fb3)}
+  #judgeLine{margin-top:5px;font-size:12px;color:#93a2b8}
+  #globalRow{margin-top:4px;font-size:12px;color:#7d8ba1;display:flex;gap:12px;flex-wrap:wrap}
+  #globalRow b{color:#cfd8e3;font-weight:600}
+  /* bottom panels */
+  #ctl{bottom:14px;left:14px;width:296px;max-height:44vh;overflow:auto}
+  #log{bottom:14px;left:50%;transform:translateX(-50%);width:360px;max-height:20vh;overflow:auto}
+  #legend{bottom:14px;right:14px;width:262px}
+  #note{font-size:12px;color:#93a2b8;line-height:1.55;margin-top:6px}
+  .badge{display:inline-block;padding:1px 7px;border-radius:8px;background:#233047;margin-left:6px;font-size:11px}
+  #winner{position:fixed;top:34%;left:50%;transform:translateX(-50%);font-size:36px;font-weight:700;
+          color:#ffd97a;text-shadow:0 0 24px #ffb70088;display:none;pointer-events:none}
+  #moves{columns:2;column-gap:16px;font-size:12.5px}
+  #moves>div{break-inside:avoid;padding:1px 0}
+  .mno{color:#7d8ba1;display:inline-block;min-width:28px;text-align:right;font-variant-numeric:tabular-nums}
+  .lg{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12.5px;color:#b6c2d4}
+  .lg i{width:13px;height:13px;border-radius:3px;flex:none}
+  .synlegend{display:flex;align-items:center;gap:6px;margin:3px 0;font-size:12px;color:#93a2b8}
+  .synlegend s{text-decoration:none;width:20px;height:3px;border-radius:2px;display:inline-block}
+  input[type=range]{width:130px;vertical-align:middle}
+  details{margin-top:6px}
+  summary{cursor:pointer;font-size:12.5px;color:#8fc1ff}
+  .pstatus{font-size:12px;color:#8fd6a4;margin-top:4px;min-height:15px}
+  .prow{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#aab6c8;margin:2px 0}
+  .prow span{width:118px;flex:none}
+  .prow input[type=range]{flex:1;width:auto;min-width:80px}
+  .prow b{width:44px;text-align:right;font-variant-numeric:tabular-nums;color:#cfd8e3}
+  /* short viewports (must stay LAST so they override the base rules above) */
+  @media (max-height: 860px){
+    #p0 table, #p1 table{font-size:11.5px} #p0 td, #p1 td{padding:0.5px 4px}
+    #ctl{max-height:36vh} #legend{max-height:30vh;overflow:auto}
+  }
+  @media (max-height: 760px){
+    .qcv, .pstat, .hint{display:none}
+    #ctl{max-height:31vh} #log{max-height:15vh} #legend{max-height:26vh}
+    .lg, .synlegend{margin:2px 0;font-size:11.5px}
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="winner"></div>
+
+<!-- top-center: winrate + global state -->
+<div class="panel" id="wr">
+  <h3 style="margin-bottom:4px">赢率估计 · 五子棋评估器</h3>
+  <div class="wrrow"><span class="fly0" style="width:64px">果蝇0 黑</span>
+    <div class="bar"><i id="wr0" style="width:50%"></i></div><b id="wr0t" class="num" style="width:48px">50%</b></div>
+  <div class="wrrow"><span class="fly1" style="width:64px">果蝇1 白</span>
+    <div class="bar w1"><i id="wr1" style="width:50%"></i></div><b id="wr1t" class="num" style="width:48px">50%</b></div>
+  <div id="judgeLine">评估器就绪</div>
+  <div id="globalRow">
+    <span>局面 <b id="phase">–</b></span><span>手数 <b id="mv">–</b></span>
+    <span>耗时 <b id="mvs">–</b></span><span>仿真 <b id="tick">–</b></span>
+    <span>对局 <b id="gcount">–</b></span><span title="结构r=原始发放率向量相关（同一连接组天然偏高）；波动r=采样间变化量相关（真正的同步性检验，越接近 0 越独立）">两脑相关 <b id="indep">–</b></span>
+    <span id="msrc" title="驱动肢体运动的神经元池来源：MaleCNS 注释表的真实运动神经元，或未加载时的空间代理">肢体绑定 –</span>
+  </div>
+</div>
+
+<!-- top-left / top-right: each fly's connectome (fixed view, synapses colored by plasticity) -->
+<div class="panel" id="p0">
+  <h3 class="fly0">果蝇0 · 黑方 <span class="badge" id="src0">初始突触</span></h3>
+  <div class="bview" id="bv0"></div>
+  <div class="hint">拖动旋转 · 滚轮缩放 · 双击复位（视角会记住）</div>
+  <table id="t0"></table>
+  <canvas class="qcv" id="qc0"></canvas>
+  <div class="pstat" id="qs0">每局平均Q曲线</div>
+</div>
+<div class="panel" id="p1">
+  <h3 class="fly1">果蝇1 · 白方 <span class="badge" id="src1">初始突触</span></h3>
+  <div class="bview" id="bv1"></div>
+  <div class="hint">拖动旋转 · 滚轮缩放 · 双击复位（视角会记住）</div>
+  <table id="t1"></table>
+  <canvas class="qcv" id="qc1"></canvas>
+  <div class="pstat" id="qs1">每局平均Q曲线</div>
+</div>
+
+<!-- bottom-left: controls -->
+<div class="panel" id="ctl">
+  <h3>控制台</h3>
+  <button id="bPause">暂停</button><button id="bResume">继续</button>
+  <button id="bStep" style="background:#1f4a2c;border-color:#3f8f57">单步：下一手</button>
+  <button id="bReset">重开一局</button>
+  <button id="bGame" disabled title="围棋打分模型算力需求评估中">围棋模式(评估中)</button>
+  <div style="height:4px"></div>
+  <button id="bInstinct" class="on">本能加权: 开</button>
+  <button id="bPlastic" class="on">突触可塑性: 开</button>
+  <div>本能权重 α <input type="range" id="bAlpha" min="0" max="2" step="0.05" value="0.9">
+       <b id="bAlphaV" class="num">0.90</b></div>
+  <div>思考时长
+    <select id="bSpeed">
+      <option value="60">短 (60 tick)</option>
+      <option value="120" selected>标准 (120 tick)</option>
+      <option value="240">长 (240 tick)</option>
+    </select></div>
+  <div style="height:4px"></div>
+  <b>多巴胺刺激（手动）</b><br>
+  <button class="fly0" onclick="dop(0,1)">果蝇0 +奖励</button><button class="warn" onclick="dop(0,-1)">果蝇0 −惩罚</button>
+  <button class="fly1" onclick="dop(1,1)">果蝇1 +奖励</button><button class="warn" onclick="dop(1,-1)">果蝇1 −惩罚</button>
+  <div style="height:4px"></div>
+  <b>档位</b> <button id="bProfT" class="on">训练档</button><button id="bProfP">零训练档</button>
+  <div class="pstat" style="margin-bottom:4px">零训练档=初始突触、独立存档，不动训练档；再关掉"突触可塑性"即纯原始反应</div>
+  <div style="height:4px"></div>
+  <b>自主等级</b> <button id="bA1" class="on">一重·闭环</button><button id="bA2">二重·神经主导</button>
+  <div class="pstat" id="autoNote">一重·闭环：脑决定落点，身体由代码执行（到达/抓取/放置均有保底，永不卡局）</div>
+  <b>突触重塑持久化</b><br>
+  <button id="bSave">保存</button><button id="bLoad">重载</button><button id="bClear" class="warn">清除本档</button>
+  <div class="pstatus" id="pstat">未加载</div>
+  <details>
+    <summary>物理与神经映射参数（可配置）</summary>
+    <div id="physRows"></div>
+    <button id="physReset" style="margin-top:4px">恢复默认</button>
+  </details>
+  <details>
+    <summary>奖惩机制与声明</summary>
+    <div id="note">
+      <b>奖惩机制</b>：外部五子棋评估器（棋型打分 + 必胜/必防检测）为每一手打分 Q∈[0,1]，
+      多巴胺奖励 r = clip((Q−0.2)×2.5, −1, +1)：好棋大正向、坏棋负向（惩罚）、获胜 +1、
+      失败 −1、手动按钮 ±1。三个因子（多巴胺脉冲 × 走子前后痕迹）作用于真实 KC→MBON 突触，
+      动态重塑蘑菇体增益；局末自动保存到 saves/，重启后自动加载。
+      <b>本能权重 α</b>：把棋型显著性作为候选落点输入电流的增益倍率（工程化的注意力输入，
+      非脑输出）；最终选择仍由 MBON 读出决定。
+      <b>身体与飞行</b>：身体为 flybody（DeepMind）解剖级网格 + MJCF 关节层级；飞行航向由该果蝇
+      <b>自身实时神经活动</b>调制——左右半球发放不对称→偏航、背腹不对称→升力、总发放率→推力
+      （/api/steer，工程映射），叠加归航项保证到达；因此每次航线都不同。场景内自由移动暂未开放。<br>
+      <b>自主等级</b>：<b>一重·闭环</b>=脑决定落点，抓子/飞行/落子由代码执行（tool-call 式），
+      到达、抓取、放置各有保底，保证对局永不卡住；<b>二重·神经主导</b>=归航项减弱（×0.35）、
+      神经偏航全程保留，抓子与放子只认该蝇自己的腿部运动爆发信号（st.grasp），不爆发就拉起
+      重新进近，4 次失败才启用一重兜底（此时会看到它反复起落）。<br>
+      声明：候选落点→视叶/KC 神经元、MBON 群体发放→落点为<b>人工工程映射</b>（DOOMFLY / Eon 同类做法）。
+      大脑 = MaleCNS 真实连接组（<span id="nn">…</span> 神经元，25,582,938 突触连接）。
+      原始数据 flygo_data.npz 只读，重塑状态独立存放于 saves/。
+    </div>
+  </details>
+</div>
+
+<!-- bottom-center: move record -->
+<div class="panel" id="log"><h3>对局记录</h3><div id="moves">等待第一手…</div></div>
+
+<!-- bottom-right: legend -->
+<div class="panel" id="legend">
+  <h3>图例 · 决策回路（真实解剖位置）</h3>
+  <div class="lg"><i style="background:#4da6ff"></i>感觉输入神经元（桶状落点编码）</div>
+  <div class="lg"><i style="background:#ffd140"></i>KC 蘑菇体编码组（每蝇不同）</div>
+  <div class="lg"><i style="background:#ff8c2e"></i>MBON 读出（每桶一个）</div>
+  <div class="lg"><i style="background:#b8661f"></i>其余 MBON</div>
+  <div class="lg"><i style="background:#40ff8c"></i>多巴胺神经元 DAN</div>
+  <div class="lg"><i style="background:#9973e6"></i>运动神经元 MN（腿319·翅26·颈118）</div>
+  <div class="lg"><i style="background:#ff5f7a"></i>下行神经元 DN</div>
+  <div class="lg"><i style="background:#ffffff"></i>瞬时放电（越亮越活跃）</div>
+  <div style="height:4px"></div>
+  <div class="synlegend"><s style="background:#ff9a2e"></s>突触增强（重塑 m&gt;0）</div>
+  <div class="synlegend"><s style="background:#3f8fff"></s>突触削弱（m&lt;0）</div>
+  <div class="synlegend"><s style="background:#ffe9a8"></s>当前候选通路的突触</div>
+  <div class="synlegend"><s style="background:#8c5a28"></s>兴奋性突触　<s style="background:#2957a0"></s>抑制性突触　<s style="background:#1abf5e"></s>DAN 调制</div>
+  <div class="synlegend">节点坐标＝MaleCNS 突触质心真实三维位置；连线＝真实突触</div>
+</div>
+
+<script src="/three.min.js"></script>
+<script src="/main.js"></script>
+</body>
+</html>
