@@ -42,6 +42,6 @@ DESIGN.md       训练课程与自主性设计（L0–L5）
 
 ## 许可
 
-- 代码：Apache-2.0（见 LICENSE）
+- 代码：MIT（见 LICENSE）
 - 数据：`flygo_data.npz` 为 MaleCNS v1.0（CC BY 4.0，Janelia FlyEM）的衍生数据，署名见 THIRD_PARTY_NOTICES.md
 - three.js（MIT）、MuJoCo（Apache-2.0）、flybody（Apache-2.0）：见 THIRD_PARTY_NOTICES.md
