@@ -619,8 +619,9 @@ function enqueueMove(s){
   const key = lm.x+'_'+lm.y+'_'+lm.p;
   pendingKeys.add(key);
   animQueue.push({fly: f, p: lm.p, r: lm.r || 0, key, x: lm.x, y: lm.y});
-  // if the client cannot keep up, reveal the oldest queued stones without a performance
-  while (animQueue.length > 2){ const q = animQueue.shift(); revealKey(q.key); }
+  // safety valve only: with the server-side presentation gate the queue stays <=1; if it
+  // ever floods (gate off / headless dump), reveal the OLDEST stones rather than lag forever.
+  while (animQueue.length > 3){ const q = animQueue.shift(); revealKey(q.key); }
 }
 function revealKey(key){ pendingKeys.delete(key); const m = stones.get(key); if (m) m.visible = true; }
 function startNextAnim(){
@@ -654,8 +655,11 @@ async function behaviorTick(){
     if (!flies[f]) continue;
     const mine = anim && anim.fly === f && anim.kind === 'move';
     const bs = bodyState(f);
+    // presentation backlog: moves the 3D scene still owes the viewer. The server gates its
+    // next decision on this, so board state never runs ahead of the flies' own placement.
+    const busy = (anim && anim.kind === 'move' ? 1 : 0) + animQueue.length;
     try {
-      const r = await fetch('/api/motor', {method: 'POST', body: JSON.stringify({fly: f, near: mine ? anim.near : 0, holding: mine && anim.carried ? 1 : 0, wing: bs.wing, air: bs.air, contact: bs.contact})});
+      const r = await fetch('/api/motor', {method: 'POST', body: JSON.stringify({fly: f, near: mine ? anim.near : 0, holding: mine && anim.carried ? 1 : 0, wing: bs.wing, air: bs.air, contact: bs.contact, busy})});
       steer[f] = await r.json();
     } catch(e){}
   }
@@ -898,6 +902,7 @@ function updateAnim(now, dt){
         else { anim.state = 'toDish'; anim.t = 0; }
       }
       if (grab && !anim.carried){                                            // neural timing
+        window.FGStats.grab.push({wait: +anim.t.toFixed(2), src: burst ? 'burst' : 'reflex'});
         anim.carried = new THREE.Mesh(stoneGeo, anim.p === 1 ? matB : matW);
         anim.carried.position.set(0.15, fl.carryY - 0.1, 0); fl.g.add(anim.carried);
         anim.acted = anim.t;
@@ -934,6 +939,7 @@ function updateAnim(now, dt){
         else { anim.state = 'travel'; anim.t = 0; }                    // pull up, try the approach again
       }
       if (drop && anim.carried){
+        window.FGStats.place.push({wait: +anim.t.toFixed(2), src: burst ? 'burst' : 'reflex'});
         fl.g.position.x = anim.tgt.x; fl.g.position.z = anim.tgt.z;   // exact: carried and placed stone coincide
         fl.g.remove(anim.carried); anim.carried = null;
         revealKey(anim.key);
@@ -1122,6 +1128,10 @@ function loop(now){
   catch(e){ if (!errShown){ errShown = true; console.error(e); status('渲染异常: ' + e.message); } }
 }
 
+// presentation diagnostics: how long each grasp/place actually waited, and whether the
+// fly's own neural burst triggered it or the reflex fallback did (check window.FGStats)
+window.FGStats = {grab: [], place: []};
+
 // ================= deterministic init =================
 (async function init(){
   status('加载连接组与果蝇模型…');
@@ -1138,4 +1148,5 @@ function loop(now){
 })();
 // read-only debug handle (page top-level bindings are not visible to devtools isolated worlds)
 window.FG = { get flies(){ return flies; }, get net(){ return net; }, get brainView(){ return brainView; }, get auto(){ return AUTO; },
+              stats: window.FGStats,
               get brainHome(){ return brainHome; }, get POSB(){ return POSB; }, get META(){ return META; } };

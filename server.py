@@ -275,7 +275,20 @@ def play_move(fly):
     S["tick_ms"] = round(b.tick_ms_cost, 1)
     return (x, y), r
 
+# ---- presentation gate: the board must not run ahead of the flies ----------------
+# The client animates each move (fly takes off -> grabs -> places). While it is still
+# presenting, the server must NOT decide the next move, otherwise stones accumulate on the
+# board faster than the flies can place them (the old queue-overflow dump revealed stones
+# with no animation at all). /api/motor reports the client's backlog; if no client has
+# reported for 20 s (headless / tab closed), the gate opens automatically.
+_last_client = 0.0
+_client_busy = 0
 def do_one_move():
+    global _last_client, _client_busy
+    if cfg.get("gate", True) and _client_busy > 0 and time.time() - _last_client < 20.0:
+        for b in brains: b.tick()
+        time.sleep(0.05)
+        return
     fly = S["move_no"] % 2
     S["thinking"] = True
     mv, r = play_move(fly)
@@ -362,7 +375,8 @@ if os.path.exists(MOTOR_NPZ):
               "(leg=%d hind=%d neck=%d wing=%d)" % (_mLEG.sum(), _mHIND.sum(), _mNECK.sum(), _mWING.sum()))
     except Exception as e:
         print("flygo_motor.npz unreadable, spatial proxies kept: %r" % e)
-_base = [{"leg": None, "hind": None, "dors": None}, {"leg": None, "hind": None, "dors": None}]
+_base = [{"leg": None, "hind": None, "dors": None, "loom": None},
+         {"leg": None, "hind": None, "dors": None, "loom": None}]
 drive = [0.35, 0.35]
 last_penalty = [0.0, 0.0]
 def _burst(f, key, r):
@@ -387,8 +401,13 @@ def motor_step(f, near, holding, wing=0.0, air=0, contact=1.0):
     rate = b.rate
     leg = float(rate[_mLEG].mean()); hind = float(rate[_mHIND].mean())
     neck = float(rate[_mNECK].mean()); wingr = float(rate[_mWING].mean())
+    # grasp trigger: the fly's OWN neural burst. Two honest sources, take the stronger:
+    #   - leg motor pool burst (motor command), quiet under the propagation wall
+    #   - looming-proximity visual pool burst (the fly sees the target filling its view
+    #     as it dives — a genuine sensory-driven grasping reflex with per-fly timing)
+    loomr = float(rate[loom_idx[f]].mean())
     out = steer_readout(f)
-    out["grasp"] = round(_burst(f, "leg", leg), 3)
+    out["grasp"] = round(max(_burst(f, "leg", leg), _burst(f, "loom", loomr)), 3)
     out["groom_f"] = round(float(np.clip(leg / ((_base[f]["leg"] or leg) + 1e-3) - 1.0, -1.0, 1.5)), 3)
     out["groom_h"] = round(_burst(f, "hind", hind), 3)
     out["wingflick"] = round(_burst(f, "dors", wingr), 3)
@@ -547,9 +566,12 @@ class H(BaseHTTPRequestHandler):
             self._send(404, b"{}")
     def do_POST(self):
         if self.path.startswith("/api/motor"):
+            global _last_client, _client_busy
             ln = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(ln) or b"{}")
             f = int(req.get("fly", 0)) % 2
+            _last_client = time.time()
+            _client_busy = max(0, min(4, int(req.get("busy", 0))))
             out = motor_step(f, float(np.clip(req.get("near", 0.0), 0.0, 1.0)),
                              int(req.get("holding", 0)),
                              wing=float(np.clip(req.get("wing", 0.0), 0.0, 1.0)),
