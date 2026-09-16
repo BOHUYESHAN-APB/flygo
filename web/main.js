@@ -848,11 +848,14 @@ function updateAnim(now, dt){
   if (!anim) return;
   const fl = flies[anim.fly], f = anim.fly;
   anim.t += dt; anim.age += dt;
-  // watchdog: if one phase of a move somehow stops progressing, release the board
-  // (stone revealed, fly returned) so the game can never stall on a stuck animation.
+  // watchdog: if one phase of an animation stops progressing, release the board
+  // (stone revealed for moves) so the game can never stall. idleFly's homing then
+  // walks the fly back to its perch — no stranded flies, ever.
   if (anim.lastState !== anim.state){ anim.lastState = anim.state; anim.watch = now; }
-  else if (anim.kind === 'move' && now - (anim.watch || 0) > 18000){
-    console.warn('anim watchdog fired', anim.state); finishAnim(); return;
+  else if (now - (anim.watch || 0) > 15000){
+    console.warn('anim watchdog fired', anim.kind, anim.state);
+    window.FGStats.watchdog = (window.FGStats.watchdog || 0) + 1;
+    finishAnim(); return;
   }
   const rest = REST[f], dish = DISH[f], cruise = PHYS.cruise;
   const drv = (steer[f].drive !== undefined) ? steer[f].drive : 0.35;
@@ -955,6 +958,15 @@ function updateAnim(now, dt){
       anim.near = 0;
       _v.set(rest.x, rest.y + 1.7, rest.z);
       if (flyStep(fl, _v, dt, f, anim.t)){ anim.state = 'land'; anim.t = 0; }
+      // return must never hang: after 12 s give up on steering and pull the fly home directly
+      if (anim.t > 12){
+        const k = 1 - Math.exp(-3.0 * dt);
+        fl.g.position.x = lerp(fl.g.position.x, rest.x, k);
+        fl.g.position.z = lerp(fl.g.position.z, rest.z, k);
+        fl.g.position.y = lerp(fl.g.position.y, rest.y, k);
+        if (Math.hypot(fl.g.position.x - rest.x, fl.g.position.z - rest.z) < 0.08 &&
+            Math.abs(fl.g.position.y - rest.y) < 0.1){ anim.state = 'land'; anim.t = 0; }
+      }
       break; }
     case 'land': {
       const k = Math.min(1, anim.t/0.45);
@@ -978,11 +990,22 @@ function updateAnim(now, dt){
 function idleFly(f, now, t, dt){
   const fl = flies[f]; if (!fl || (anim && anim.fly === f)) return;
   const st = steer[f], drv = st.drive !== undefined ? st.drive : 0.35;
+  // HOME FIRST: after any abnormal animation end (watchdog, interruption) the fly may be
+  // standing somewhere on the board. Idle behaviour now always drifts x/y/z back to the
+  // perch — nobody can stay stranded on the board forever.
+  {
+    const rp = REST[f], kh = 1 - Math.exp(-2.0 * dt);
+    fl.g.position.x = lerp(fl.g.position.x, rp.x, kh);
+    fl.g.position.z = lerp(fl.g.position.z, rp.z, kh);
+    fl.g.position.y = lerp(fl.g.position.y, rp.y, kh);
+  }
   // low motivation -> occasional autonomous exploration flight inside the glass box
   if (!anim && !animQueue.length && cur && !(cur.thinking && cur.to_move === f) && Math.random() < dt * 0.06 * (1 - drv)){ startExplore(f, now); return; }
   const k = 1 - Math.exp(-PHYS.jointK * dt);
   const home = f === 0 ? 0 : Math.PI;
-  fl.g.position.y = REST[f].y + 0.02 * Math.sin(t * 1.7 + f * 2) + 0.015 * ((st.thrust || 1) - 1);
+  // idle bob/pose only applies once the fly has actually reached its perch
+  if (Math.hypot(fl.g.position.x - REST[f].x, fl.g.position.z - REST[f].z) < 0.15)
+    fl.g.position.y = REST[f].y + 0.02 * Math.sin(t * 1.7 + f * 2) + 0.015 * ((st.thrust || 1) - 1);
   fl.heading = home; fl.g.rotation.set(0, home + 0.03 * Math.sin(t * 0.5 + f), 0);
   // head: attention to the board grows with drive; otherwise it scans with the hemispheric signal
   const attention = clamp(0.25 + PHYS.attnGain * drv, 0, 1);
