@@ -30,7 +30,7 @@ def load_bundle():
 
 class FlyBrain:
     """One fly's brain. Shares the wiring matrix; owns its own state and plasticity."""
-    def __init__(self, bundle, seed=1, dt=0.002, sign_scale=0.05, jitter=0.25):
+    def __init__(self, bundle, seed=1, dt=0.002, rec_scale=0.30, jitter=0.25):
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         if jitter > 0.0:
@@ -51,7 +51,15 @@ class FlyBrain:
         self.sign = bundle["sign"]
         self.N = self.W.shape[0]
         self.dt = dt
-        self.scale = sign_scale
+        # recurrent coupling gain. Measured on the real wiring: a sensory volley covers >50%
+        # of the incoming weight of a few hundred dedicated rows, but stimulated neurons have
+        # a ~0.14 spike duty cycle, so effective synchrony stays ~0.07 — BELOW the firing
+        # requirement at any gain that keeps the idle brain silent. Single-hop propagation
+        # is therefore structurally suppressed by postsynaptic row-normalization (real
+        # synapses are lognormal with dominant inputs — see roadmap). Evoked activity stays
+        # in the stimulated circuit + MBON layer: sparse coding, like in-vivo fly imaging.
+        # Each fly draws its own gain (+/-10%): same species, different excitability.
+        self.scale = float(np.clip(self.rng.lognormal(np.log(rec_scale), 0.10), 0.12, 0.6))
         self.v = np.zeros(self.N, dtype=np.float32)
         self.refr = np.zeros(self.N, dtype=np.int16)
         self.vth = self.rng.uniform(0.26, 0.40, self.N).astype(np.float32)   # heterogeneous thresholds
@@ -63,6 +71,43 @@ class FlyBrain:
         self.dan_mask = np.zeros(self.N, dtype=bool); self.dan_mask[bundle["dan"]] = True
         self.dan_ticks = 0
         self.in_groups = bundle["in_groups"]; self.out_groups = bundle["out_groups"]
+        # per-fly sensory interface: each fly draws its OWN input neurons from the full
+        # visual pool (same anatomy, different individuals). out_groups is NOT redrawn:
+        # the server pairs each bucket with its MBON readout + strongest presynaptic KC.
+        # Requires vis_pool in the bundle (flygo_proprio.npz); without it both flies share
+        # the bundle groups (disclosed fallback).
+        vp = bundle.get("vis_pool")
+        NG = len(self.in_groups) if len(self.in_groups) else 64
+        # bucket fan-in: a real visual stimulus synchronously drives thousands of columns;
+        # ni_per_bucket sizes each bucket's afferent volley so downstream neurons receive
+        # assembly-level input and activity propagates through the REAL wiring.
+        ni = int(bundle.get("ni_per_bucket", self.in_groups.shape[1]))
+        if vp is not None and len(vp) >= NG * ni:
+            # RETINOTOPIC sampling: each bucket owns one contiguous anatomical sub-region of
+            # the optic lobe (z-layer x angular sector), not salt-and-pepper neurons.
+            # Columnar partners of a real sub-region share downstream targets, so a bucket's
+            # volley converges and activity propagates through the real wiring — a random
+            # subset would give every downstream neuron 1-2 active inputs, below the ~55%
+            # row-synchrony threshold that postsynaptic row-normalization imposes.
+            pos = bundle["pos"]
+            z = pos[vp, 2]; ang = np.arctan2(pos[vp, 1], pos[vp, 0])
+            zr = float(z.max() - z.min())
+            nsec = int(np.sqrt(NG) + 0.5)                      # e.g. NG=64 -> 8x8 sectors
+            li = np.minimum(((z - z.min()) / max(zr, 1e-6) * nsec).astype(int), nsec - 1)
+            si = np.minimum(((ang + np.pi) / (2*np.pi) * nsec).astype(int), nsec - 1)
+            cell = li * nsec + si
+            take = []
+            rng_perm = self.rng.permutation(len(vp))          # own draw order inside cells
+            for k in range(NG):
+                members = vp[cell == (k % (nsec*nsec))] if k < nsec*nsec else vp
+                if len(members) < ni:                         # pad from the whole pool
+                    extra = self.rng.choice(np.setdiff1d(vp, members, assume_unique=False),
+                                            ni - len(members), replace=False)
+                    members = np.concatenate([members, extra])
+                else:
+                    members = self.rng.choice(members, ni, replace=False)
+                take.append(members)
+            self.in_groups = np.concatenate(take).astype(np.int64).reshape(NG, ni)
         # plasticity subset (true KC->MBON synapses); plasticity acts on a multiplicative
         # gain m: effective weight = base * (1 + m)  ->  scale-free, biologically tidy
         self.pl_pre = bundle["pl_pre"]; self.pl_post = bundle["pl_post"]
@@ -96,14 +141,38 @@ class FlyBrain:
             cand = self.pl_pre[self.pl_post == mbon] if mbon >= 0 else []
             new_pairs[int(k)] = int(self.rng.choice(cand)) if len(cand) else int(v)
         self.kc_pairs = new_pairs
+        # ---- per-bucket readout: the REAL MBONs this bucket's KC codebook synapses onto ----
+        # Decision = population rate of the mushroom-body output neurons that this bucket's
+        # codebook actually drives (plus the bucket's DN group). This is the layer where
+        # three-factor plasticity acts, so dopamine literally rewrites the decision scores.
+        self._pre2post = {}
+        for _p, _q in zip(self.pl_pre.tolist(), self.pl_post.tolist()):
+            self._pre2post.setdefault(_p, []).append(_q)
+        self._build_readout()
         self.plasticity_on = True
         self.pending_reward = 0.0
         self.stats = {"rewards": 0, "remodel_events": 0, "syn_changed": 0, "dw_total": 0.0, "last_reward": 0.0}
         self.tick_ms_cost = 0.0
 
+    def _build_readout(self):
+        """readout_groups[k] = real MBONs postsynaptic to bucket k's KC codebook"""
+        self.readout_groups = []
+        NG_ = len(self.in_groups)
+        for k in range(NG_):
+            ks = set(self.kc_groups[k].tolist()) if len(self.kc_groups) and k < len(self.kc_groups) else set()
+            if k in self.kc_pairs: ks.add(int(self.kc_pairs[k]))
+            mb = sorted({q for kc in ks for q in self._pre2post.get(kc, ())})
+            self.readout_groups.append(np.array(mb[:12], dtype=np.int64))
+
     # ---- sensory stimulation -----------------------------------------------
     def clear_input(self):
         self.I_ext.fill(0.0)
+
+    def stimulate_pool(self, idx, current):
+        """drive an arbitrary real neuron pool (e.g. mechanosensory/proprioceptive afferents)
+        with a scalar current — body->brain feedback uses this"""
+        if len(idx):
+            self.I_ext[idx] = np.float32(current)
 
     def stimulate_group(self, k, current):
         """excite input bucket k (candidate move k) + its mushroom-body codebook,
@@ -131,11 +200,16 @@ class FlyBrain:
         # stimulus-driven regime: noise floor alone stays sub-threshold (v~0.10 < vth~0.26+),
         # activity comes from stimulation + recurrent amplification. (A tonic 0.22 test caused
         # whole-brain ignition: recurrent gain + plastic KC->MBON feedback are hair-trigger.)
-        I = noise + self.I_ext + self.scale * (self.W @ (self.s_last * self.sign))
+        # NOTE: W already carries neurotransmitter sign (prepare_data.py multiplies sign into
+        # the edge weights) — do NOT multiply by sign again: that squares it (+-1 -> +1) and
+        # turns every inhibitory synapse into an excitatory one. Signed recurrence means
+        # GABAergic/glutamatergic inputs now genuinely hyperpolarize their targets.
+        I = noise + self.I_ext + self.scale * (self.W @ self.s_last)
         if len(self.pl_w0):
             # remodeled mushroom-body synapses feed back into the dynamics
+            # (pl_w0 already carries sign — same rule as the main recurrent term)
             I += 2000.0 * np.bincount(self.pl_post,
-                                    weights=(self.pl_w0 * (1.0 + self.pl_m)) * self.s_last[self.pl_pre] * self.sign[self.pl_pre],
+                                    weights=(self.pl_w0 * (1.0 + self.pl_m)) * self.s_last[self.pl_pre],
                                     minlength=self.N).astype(np.float32)
         if self.dan_ticks > 0:
             I[self.dan_mask] += 1.2
@@ -172,15 +246,26 @@ class FlyBrain:
                 "spike_frac": round(float((r > 1.0).mean()), 4),
                 "v_sat_frac": round(float((np.abs(self.v) > 0.95).mean()), 4),
                 "pl_abs_mean": round(float(np.abs(self.pl_m).mean()), 4) if len(self.pl_m) else 0.0,
-                "pl_changed": int((np.abs(self.pl_m) > 0.05).sum())}
+                "pl_changed": int((np.abs(self.pl_m) > 0.05).sum()),
+                "rec_scale": round(float(self.scale), 3)}
 
     # ---- readout --------------------------------------------------------------
     def bucket_rates(self, acc, n_ticks):
-        """acc: float32 array (N,) accumulated spikes over the window"""
-        og = self.out_groups
-        if len(og) == 0 or n_ticks == 0:
-            return np.zeros(64, dtype=np.float32)
-        return acc[og].mean(axis=1) / (n_ticks * self.dt)
+        """acc: float32 array (N,) accumulated spikes over the window.
+        Per bucket: MBON readout population (plasticity lives here) + its DN group.
+        Returns Hz-like rates, shape (n_buckets,)."""
+        if n_ticks == 0:
+            return np.zeros(len(self.readout_groups), dtype=np.float32)
+        T = n_ticks * self.dt
+        out = np.zeros(len(self.readout_groups), dtype=np.float32)
+        for k, mb in enumerate(self.readout_groups):
+            s = 0.0
+            if len(mb):
+                s += float(acc[mb].mean()) / T
+            if k < len(self.out_groups) and len(self.out_groups[k]):
+                s += 0.5 * float(acc[self.out_groups[k]].mean()) / T
+            out[k] = s
+        return out
 
     # ---- persistence: everything learned lives in pl_m (+ the codebook identity) ----
     # The original flygo_data.npz is NEVER written by the simulator; state files are
@@ -200,6 +285,7 @@ class FlyBrain:
         kg = z["kc_groups"].astype(np.int64)
         if kg.shape == self.kc_groups.shape:
             self.kc_groups = kg        # keep bucket->KC identity stable across restarts
+            self._build_readout()      # readout MBONs follow the restored codebook
         self.stats = json.loads(str(z["stats_json"]))
 
     def reset_plasticity(self):

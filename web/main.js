@@ -637,13 +637,25 @@ function startExplore(f, now){
   anim = {kind: 'explore', fly: f, state: 'takeoff', t: 0, age: 0, near: 0, carried: null, until: now + 3500 + 5000 * Math.random()};
   flies[f].heading = f === 0 ? 0 : Math.PI;
 }
-// standing behaviour loop: every fly reports its situation and receives its own motor readouts
+// standing behaviour loop: every fly reports its situation and receives its own motor readouts.
+// The report now closes the body->brain loop: wing amplitude (flight effort), airborne flag
+// (body height vs resting perch) and tarsal contact feed the server's REAL mechanosensory
+// afferent pools (Johnston's organ / chordotonal / tarsal), so the brain senses its own flight.
+function bodyState(f){
+  const fl = flies[f]; if (!fl) return {wing: 0, air: 0, contact: 1};
+  const p = fl.g.position, alt = p.y - REST[f].y;
+  const air = alt > 0.4 ? 1 : 0;
+  const wing = air ? Math.min(1, 0.55 + 0.45 * (steer[f].thrust || 1)) : 0.06 * (0.5 + 0.5 * (steer[f].wingflick || 0));
+  const contact = air ? 0.1 : 1;
+  return {wing: +wing.toFixed(3), air, contact};
+}
 async function behaviorTick(){
   for (let f = 0; f < 2; f++){
     if (!flies[f]) continue;
     const mine = anim && anim.fly === f && anim.kind === 'move';
+    const bs = bodyState(f);
     try {
-      const r = await fetch('/api/motor', {method: 'POST', body: JSON.stringify({fly: f, near: mine ? anim.near : 0, holding: mine && anim.carried ? 1 : 0})});
+      const r = await fetch('/api/motor', {method: 'POST', body: JSON.stringify({fly: f, near: mine ? anim.near : 0, holding: mine && anim.carried ? 1 : 0, wing: bs.wing, air: bs.air, contact: bs.contact})});
       steer[f] = await r.json();
     } catch(e){}
   }

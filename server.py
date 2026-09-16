@@ -16,6 +16,23 @@ FLY_MODEL = r"G:\guoying\flygo\fly_model.bin"
 
 bundle = load_bundle()
 N = bundle["W"].shape[0]
+# real mechanosensory/proprioceptive pools + full visual pool (flygo_proprio.npz, built from
+# MaleCNS annotations by build_proprio.py; flygo_data.npz stays untouched). These give:
+#   - per-fly input redraw from the full visual neuron population (independent "eyes")
+#   - body->brain feedback channels (wing wind -> Johnston's organ, tarsal contact, chordotonal)
+PROPRIO_NPZ = r"G:\guoying\flygo\flygo_proprio.npz"
+proprio = None
+if os.path.exists(PROPRIO_NPZ):
+    try:
+        pz = np.load(PROPRIO_NPZ)
+        proprio = {k: pz[k].astype(np.int64) for k in pz.files}
+        bundle["vis_pool"] = proprio["vis_pool"]
+        bundle["ni_per_bucket"] = 400          # real afferent volley size per bucket
+        print("proprio pools: ch=%d touch=%d jo=%d asc=%d vis_pool=%d" % (
+            len(proprio["prop_ch"]), len(proprio["prop_touch"]), len(proprio["prop_jo"]),
+            len(proprio["prop_asc"]), len(proprio["vis_pool"])))
+    except Exception as e:
+        print("flygo_proprio.npz unreadable, shared inputs kept: %r" % e)
 # readout from mushroom-body output neurons (MBON): the KC->MBON synapses we remodel
 # ARE the decision pathway, so plasticity directly shapes future moves.
 mb = bundle["mbon"]
@@ -36,6 +53,12 @@ if len(mb) >= 64:
 else:
     bundle["kc_pairs"] = {}
 brains = [FlyBrain(bundle, seed=1, jitter=0.15), FlyBrain(bundle, seed=7, jitter=0.15)]
+# per-fly "loom" neurons: a private 64-neuron visual subset per fly that the proximity of the
+# board/dish excites (engineered looming stimulus — replaces the old direct current into leg
+# MOTOR neurons, which was anatomically backwards: sensory drive belongs in sensory afferents).
+loom_rng = [np.random.default_rng(11), np.random.default_rng(77)]
+loom_idx = [rng.choice(bundle.get("vis_pool", bundle["in_groups"].reshape(-1)), min(64, len(bundle.get("vis_pool", bundle["in_groups"].reshape(-1)))), replace=False)
+            for rng in loom_rng]
 # same base connectome (one species), but each fly owns an individually-jittered copy of the
 # synaptic weights, its own sensory gains, and its own codebook -> genuinely different dynamics.
 # jitter 0.15: strong enough for individual dynamics, small enough to avoid inhibitory collapse.
@@ -199,8 +222,17 @@ def play_move(fly):
             return None, 0.0
         cands = [(int(x), int(y)) for y, x in empt[:64]]
     b.clear_input()
+    # ---- each fly sees the board from ITS OWN side --------------------------------
+    # fly 1 sits opposite fly 0: its coordinate frame is the board rotated 180 degrees, its
+    # salience map is computed in that frame, and its candidates are scanned from its own
+    # corner. The two brains therefore receive genuinely different input transforms for the
+    # same position — not one shared global encoding.
+    SZ = gm.size
+    rot = lambda x, y: (x, y) if fly == 0 else (SZ - 1 - x, SZ - 1 - y)
+    home = (0, 0) if fly == 0 else (SZ - 1, SZ - 1)
+    cands.sort(key=lambda c: (c[0]-home[0])**2 + (c[1]-home[1])**2)
     # salience: normalized heuristic attention (engineered input gain, NOT the decision).
-    evs = np.array([gm.eval_cell(x, y, p) for (x, y) in cands], dtype=np.float32)
+    evs = np.array([gm.eval_cell(*rot(x, y), p) for (x, y) in cands], dtype=np.float32)
     emax = float(evs.max()) + 1e-6
     for k, (x, y) in enumerate(cands):
         sal = 1.0 + (cfg["instinct_alpha"] * float(evs[k]) / emax if cfg["instinct"] else 0.0)
@@ -220,6 +252,7 @@ def play_move(fly):
     b.tick_ms_cost = 1000.0 * tsum / nt
     rates = b.bucket_rates(acc, nt)
     b.last_bucket_rates = rates
+    evr[fly] |= acc > 0                      # propagation tracking for /api/diag
     kk = int(np.argmax(rates[:len(cands)]))
     x, y = cands[kk]
     b.last_bucket = kk
@@ -337,26 +370,72 @@ def _burst(f, key, r):
     if b[key] is None: b[key] = r                     # baseline starts at the first observation
     b[key] = 0.97 * b[key] + 0.03 * r
     return float(np.clip((r - b[key]) / (b[key] + 1e-3) * PHYS_SRV["burst_gain"], -1.0, 1.0))
-def motor_step(f, near, holding):
+def motor_step(f, near, holding, wing=0.0, air=0, contact=1.0):
+    """One body<->brain exchange. Readouts go body-ward; the fly's own mechanosensory
+    afferents feed back brain-ward: wingbeat airflow -> Johnston's organ + chordotonal
+    organs, tarsal contact -> leg afferents. This closes the loop the old version lacked:
+    the brain now SENSES its own wings and legs while it flies."""
     b = brains[f]
-    b.I_ext[_mLEG] = np.float32(PHYS_SRV["near_current"] * near)
+    # sensory side (afferents, not motor neurons): looming board + proprioceptive feedback
+    b.stimulate_pool(loom_idx[f], PHYS_SRV["near_current"] * near)
+    if proprio is not None:
+        wing = float(np.clip(wing, 0, 1)); air = 1 if air else 0
+        contact = float(np.clip(contact, 0, 1)); holding = 1 if holding else 0
+        b.stimulate_pool(proprio["prop_jo"], 0.35 * wing * air)          # antennal wind field
+        b.stimulate_pool(proprio["prop_ch"], 0.18 * wing * air + 0.06 * (1 - air))  # body strain
+        b.stimulate_pool(proprio["prop_touch"], 0.30 * contact + 0.25 * holding)    # tarsi
     rate = b.rate
     leg = float(rate[_mLEG].mean()); hind = float(rate[_mHIND].mean())
-    neck = float(rate[_mNECK].mean()); wing = float(rate[_mWING].mean())
+    neck = float(rate[_mNECK].mean()); wingr = float(rate[_mWING].mean())
     out = steer_readout(f)
     out["grasp"] = round(_burst(f, "leg", leg), 3)
     out["groom_f"] = round(float(np.clip(leg / ((_base[f]["leg"] or leg) + 1e-3) - 1.0, -1.0, 1.5)), 3)
     out["groom_h"] = round(_burst(f, "hind", hind), 3)
-    out["wingflick"] = round(_burst(f, "dors", wing), 3)
+    out["wingflick"] = round(_burst(f, "dors", wingr), 3)
     out["neck"] = round(float(np.clip(neck / ((_base[f]["dors"] or neck) + 1e-3) - 1.0, -1.0, 1.5)), 3)
     out["dan"] = round(float(rate[_mDANm].mean()), 3)
     out["drive"] = round(drive[f], 3)
     out["leg_rate"] = round(leg, 3)
+    if proprio is not None:
+        out["prop"] = {"jo": round(float(rate[proprio["prop_jo"]].mean()), 3),
+                       "ch": round(float(rate[proprio["prop_ch"]].mean()), 3),
+                       "touch": round(float(rate[proprio["prop_touch"]].mean()), 3)}
     return out
 def update_drive(f, r):
     """dopamine motivation: rewards raise it (addiction), punishment/time erode it"""
     drive[f] = float(np.clip(drive[f] * PHYS_SRV["drive_decay"] + PHYS_SRV["drive_gain"] * max(r, 0.0)
                              - 0.12 * max(-r, 0.0), 0.05, 1.0))
+
+# ---- propagation diagnostics: does activity actually spread through the wiring? ----
+evr = [np.zeros(N, dtype=bool), np.zeros(N, dtype=bool)]      # ever-active during think windows
+_reach_cache = None
+def diag_snapshot():
+    """per-class participation of each brain + structural reachability of the wiring"""
+    global _reach_cache
+    if _reach_cache is None:
+        W = bundle["W"]
+        fr = np.zeros(N, dtype=bool); fr[bundle["in_groups"].reshape(-1)] = True
+        reach = np.zeros(N, dtype=bool); sizes = []
+        for _ in range(3):
+            fr = ((W @ fr.astype(np.float32)) != 0) & ~reach
+            reach |= fr
+            sizes.append(int(reach.sum()))
+        _reach_cache = sizes
+    out = {"reach_3hops": _reach_cache, "reach_frac": round(_reach_cache[-1] / N, 4), "flies": []}
+    for f in range(2):
+        cls = {"vis_in": brains[f].in_groups.reshape(-1), "kc": bundle["kc"],
+               "mbon": bundle["mbon"], "dan": bundle["dan"],
+               "mn": np.where(_mLEG | _mHIND | _mNECK | _mWING)[0]}
+        if proprio is not None:
+            cls["proprio_ch"] = proprio["prop_ch"]; cls["proprio_jo"] = proprio["prop_jo"]
+            cls["proprio_touch"] = proprio["prop_touch"]
+        by = {k: round(float(evr[f][v].mean()), 4) if len(v) else 0.0 for k, v in cls.items()}
+        rest = np.ones(N, dtype=bool)
+        for v in cls.values(): rest[v] = False
+        by["everything_else"] = round(float(evr[f][rest].mean()), 4)
+        out["flies"].append({"ever_active": round(float(evr[f].mean()), 4), "by_class": by,
+                             "health": brains[f].health()})
+    return out
 
 try_load_all()          # restore remodeled synapses from saves/ if present
 threading.Thread(target=sim_loop, daemon=True).start()
@@ -421,6 +500,12 @@ class H(BaseHTTPRequestHandler):
             body = (np.array([len(pre)], dtype=np.int32).tobytes() +
                     pre.tobytes() + post.tobytes() + m.tobytes())
             self._send(200, body, "application/octet-stream")
+        elif path == "/api/diag":
+            # propagation audit: per-class activity of the last think window + structural
+            # reachability. Answers "why don't the other neurons change" with numbers.
+            with lock:
+                body = json.dumps(diag_snapshot()).encode()
+            self._send(200, body)
         elif path == "/api/net":
             # decision-circuit subgraph of one fly: the neurons we stimulate/read + every real
             # synapse between them. [2 int32 n_nodes n_edges][nodes][pre][post][signed w]
@@ -450,7 +535,13 @@ class H(BaseHTTPRequestHandler):
                     "pairs1": {str(k): int(v) for k, v in brains[1].kc_pairs.items()},
                     "motor_source": motor_source,
                     "motor_counts": {"leg": int(_mLEG.sum()), "hind": int(_mHIND.sum()),
-                                     "wing": int(_mWING.sum()), "neck": int(_mNECK.sum())}}
+                                     "wing": int(_mWING.sum()), "neck": int(_mNECK.sum())},
+                    "proprio_source": "real_afferents" if proprio is not None else "none",
+                    "proprio_counts": ({k: int(len(proprio[k])) for k in
+                                        ("prop_ch", "prop_touch", "prop_jo", "prop_asc")}
+                                       if proprio is not None else {}),
+                    "ni_per_bucket": int(bundle.get("ni_per_bucket", 0)),
+                    "per_fly_inputs": bool(bundle.get("vis_pool") is not None)}
             self._send(200, json.dumps(meta).encode())
         else:
             self._send(404, b"{}")
@@ -459,7 +550,11 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(ln) or b"{}")
             f = int(req.get("fly", 0)) % 2
-            out = motor_step(f, float(np.clip(req.get("near", 0.0), 0.0, 1.0)), int(req.get("holding", 0)))
+            out = motor_step(f, float(np.clip(req.get("near", 0.0), 0.0, 1.0)),
+                             int(req.get("holding", 0)),
+                             wing=float(np.clip(req.get("wing", 0.0), 0.0, 1.0)),
+                             air=int(req.get("air", 0)),
+                             contact=float(np.clip(req.get("contact", 1.0), 0.0, 1.0)))
             self._send(200, json.dumps(out).encode()); return
         if self.path != "/api/control":
             self._send(404, b"{}"); return
